@@ -261,6 +261,17 @@ function providerCfg(url: string) {
   }
 }
 
+function badTitleCfg(url: string) {
+  return {
+    ...providerCfg(url),
+    agent: {
+      title: {
+        model: "test/missing-model",
+      },
+    },
+  }
+}
+
 const user = Effect.fn("test.user")(function* (sessionID: SessionID, text: string) {
   const session = yield* Session.Service
   const msg = yield* session.updateMessage({
@@ -736,6 +747,65 @@ it.live(
     ),
   3_000,
 )
+
+  it.live(
+    "title generation falls back to active model when small model is unavailable",
+    () =>
+      provideTmpdirServer(
+        Effect.fnUntraced(function* ({ llm }) {
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          yield* llm.text("world")
+
+          const chat = yield* sessions.create({})
+          yield* prompt.prompt({
+            sessionID: chat.id,
+            agent: "build",
+            noReply: true,
+            parts: [{ type: "text", text: "请帮我检查内网命名问题" }],
+          })
+
+          const result = yield* prompt.loop({ sessionID: chat.id })
+          expect(result.info.role).toBe("assistant")
+          yield* llm.wait(2)
+
+          const next = yield* sessions.get(chat.id)
+        expect(next.title).toBe("E2E Title")
+        }),
+        { git: true, config: providerCfg },
+      ),
+    10_000,
+  )
+
+  it.live(
+    "invalid title override falls back without breaking the main reply",
+    () =>
+      provideTmpdirServer(
+        Effect.fnUntraced(function* ({ llm }) {
+          const prompt = yield* SessionPrompt.Service
+          const sessions = yield* Session.Service
+          yield* llm.text("world")
+
+          const chat = yield* sessions.create({})
+          yield* prompt.prompt({
+            sessionID: chat.id,
+            agent: "build",
+            noReply: true,
+            parts: [{ type: "text", text: "请继续主对话" }],
+          })
+
+          const result = yield* prompt.loop({ sessionID: chat.id })
+          expect(result.info.role).toBe("assistant")
+          expect(result.parts.some((part) => part.type === "text" && part.text === "world")).toBe(true)
+        yield* llm.wait(2)
+
+          const next = yield* sessions.get(chat.id)
+        expect(next.title).toBe("E2E Title")
+        }),
+      { git: true, config: badTitleCfg },
+      ),
+    10_000,
+  )
 
 it.live(
   "cancel finalizes subtask tool state",

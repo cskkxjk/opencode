@@ -1,5 +1,5 @@
 import { test, expect } from "bun:test"
-import { mkdir, unlink } from "fs/promises"
+import { mkdir, stat, unlink, utimes } from "fs/promises"
 import path from "path"
 
 import { tmpdir } from "../fixture/fixture"
@@ -1015,6 +1015,31 @@ test("getSmallModel respects config small_model override", async () => {
       expect(String(model?.id)).toBe("claude-sonnet-4-20250514")
     },
   })
+})
+
+test("models refresh keeps cached models when fetch fails", async () => {
+  const file = process.env["OPENCODE_MODELS_PATH"]
+  expect(file).toBeDefined()
+  if (!file) return
+
+  const prev = globalThis.fetch
+  const info = await stat(file)
+  const old = new Date(Date.now() - 10 * 60 * 1000)
+
+  ModelsDev.Data.reset()
+  globalThis.fetch = (() => Promise.reject(new Error("offline"))) as unknown as typeof fetch
+  await utimes(file, old, old)
+
+  try {
+    await ModelsDev.refresh()
+    ModelsDev.Data.reset()
+    const result = await ModelsDev.get()
+    expect(Object.keys(result).length).toBeGreaterThan(0)
+  } finally {
+    globalThis.fetch = prev
+    await utimes(file, info.atime, info.mtime)
+    ModelsDev.Data.reset()
+  }
 })
 
 test("provider.sort prioritizes preferred models", () => {

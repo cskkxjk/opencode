@@ -120,6 +120,33 @@ export namespace ModelsDev {
     return !force && fresh()
   }
 
+  function error(input: unknown) {
+    return input instanceof Error ? input : new Error(String(input))
+  }
+
+  async function file() {
+    return Filesystem.readJson(Flag.OPENCODE_MODELS_PATH ?? filepath).catch(() => undefined)
+  }
+
+  async function snapshot() {
+    // @ts-ignore generated in build artifacts, absent in some dev/test flows
+    return import("./models-snapshot.js")
+      .then((m) => m.snapshot as Record<string, unknown>)
+      .catch(() => undefined)
+  }
+
+  async function fallback() {
+    const result = await file()
+    if (result) return { result, source: "cache" as const }
+    const snap = await snapshot()
+    if (snap) return { result: snap, source: "snapshot" as const }
+    return
+  }
+
+  async function parse(text: string) {
+    return JSON.parse(text) as Record<string, unknown>
+  }
+
   const fetchApi = async () => {
     const result = await fetch(`${url()}/api.json`, {
       headers: { "User-Agent": Installation.USER_AGENT },
@@ -129,25 +156,36 @@ export namespace ModelsDev {
   }
 
   export const Data = lazy(async () => {
-    const result = await Filesystem.readJson(Flag.OPENCODE_MODELS_PATH ?? filepath).catch(() => {})
-    if (result) return result
-    // @ts-ignore
-    const snapshot = await import("./models-snapshot.js")
-      .then((m) => m.snapshot as Record<string, unknown>)
-      .catch(() => undefined)
-    if (snapshot) return snapshot
-    if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
-    return Flock.withLock(`models-dev:${filepath}`, async () => {
-      const result = await Filesystem.readJson(Flag.OPENCODE_MODELS_PATH ?? filepath).catch(() => {})
-      if (result) return result
-      const result2 = await fetchApi()
-      if (result2.ok) {
-        await Filesystem.write(filepath, result2.text).catch((e) => {
-          log.error("Failed to write models cache", { error: e })
-        })
-      }
-      return JSON.parse(result2.text)
-    })
+    try {
+      const local = await fallback()
+      if (local) return local.result
+      if (Flag.OPENCODE_DISABLE_MODELS_FETCH) return {}
+      return await Flock.withLock(`models-dev:${filepath}`, async () => {
+        const cached = await fallback()
+        if (cached) return cached.result
+        const fetched = await fetchApi()
+        if (fetched.ok) {
+          await Filesystem.write(filepath, fetched.text).catch((e) => {
+            log.error("Failed to write models cache", { error: e })
+          })
+        }
+        try {
+          return await parse(fetched.text)
+        } catch (cause) {
+          const err = error(cause)
+          const local = await fallback()
+          if (local) {
+            log.warn("Invalid models.dev payload, using fallback", { error: err, source: local.source })
+            return local.result
+          }
+          throw err
+        }
+      })
+    } catch (cause) {
+      const local = await fallback()
+      if (local) return local.result
+      throw cause
+    }
   })
 
   export async function get() {
@@ -157,17 +195,33 @@ export namespace ModelsDev {
 
   export async function refresh(force = false) {
     if (skip(force)) return ModelsDev.Data.reset()
-    await Flock.withLock(`models-dev:${filepath}`, async () => {
-      if (skip(force)) return ModelsDev.Data.reset()
-      const result = await fetchApi()
-      if (!result.ok) return
-      await Filesystem.write(filepath, result.text)
-      ModelsDev.Data.reset()
-    }).catch((e) => {
+    try {
+      await Flock.withLock(`models-dev:${filepath}`, async () => {
+        if (skip(force)) return ModelsDev.Data.reset()
+        const result = await fetchApi()
+        if (!result.ok) return
+        await Filesystem.write(filepath, result.text)
+        ModelsDev.Data.reset()
+      })
+    } catch (e) {
+      if (force) {
+        log.error("Failed to fetch models.dev", {
+          error: e,
+        })
+        return
+      }
+      const local = await fallback()
+      if (local) {
+        log.warn("Failed to refresh models.dev, using fallback", {
+          error: e,
+          source: local.source,
+        })
+        return
+      }
       log.error("Failed to fetch models.dev", {
         error: e,
       })
-    })
+    }
   }
 }
 

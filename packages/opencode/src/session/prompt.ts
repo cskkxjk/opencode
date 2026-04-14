@@ -176,14 +176,37 @@ export namespace SessionPrompt {
 
         const ag = yield* agents.get("title")
         if (!ag) return
-        const mdl = ag.model
-          ? yield* provider.getModel(ag.model.providerID, ag.model.modelID)
-          : ((yield* provider.getSmallModel(input.providerID)) ??
-            (yield* provider.getModel(input.providerID, input.modelID)))
+
+        const errs: unknown[] = []
+        const pick = yield* Effect.fn("SessionPrompt.pickTitleModel")(function* () {
+          if (ag.model) {
+            const custom = yield* provider.getModel(ag.model.providerID, ag.model.modelID).pipe(Effect.exit)
+            if (Exit.isSuccess(custom)) return custom.value
+            errs.push(Cause.squash(custom.cause))
+          }
+
+          const small = yield* provider.getSmallModel(input.providerID).pipe(Effect.exit)
+          if (Exit.isSuccess(small) && small.value) return small.value
+          if (Exit.isFailure(small)) errs.push(Cause.squash(small.cause))
+
+          const base = yield* provider.getModel(input.providerID, input.modelID).pipe(Effect.exit)
+          if (Exit.isSuccess(base)) return base.value
+          errs.push(Cause.squash(base.cause))
+          return
+        })()
+        if (!pick) {
+          yield* elog.warn("title model unavailable", {
+            providerID: input.providerID,
+            modelID: input.modelID,
+            errors: errs,
+          })
+          return
+        }
+        const mdl = pick
         const msgs = onlySubtasks
           ? [{ role: "user" as const, content: subtasks.map((p) => p.prompt).join("\n") }]
           : yield* MessageV2.toModelMessagesEffect(context, mdl)
-        const text = yield* llm
+        const result = yield* llm
           .stream({
             agent: ag,
             user: firstInfo,
@@ -199,8 +222,17 @@ export namespace SessionPrompt {
             Stream.filter((e): e is Extract<LLM.Event, { type: "text-delta" }> => e.type === "text-delta"),
             Stream.map((e) => e.text),
             Stream.mkString,
-            Effect.orDie,
+            Effect.exit,
           )
+        if (Exit.isFailure(result)) {
+          yield* elog.warn("title generation failed", {
+            providerID: String(mdl.providerID),
+            modelID: String(mdl.id),
+            error: Cause.squash(result.cause),
+          })
+          return
+        }
+        const text = result.value
         const cleaned = text
           .replace(/<think>[\s\S]*?<\/think>\s*/g, "")
           .split("\n")
